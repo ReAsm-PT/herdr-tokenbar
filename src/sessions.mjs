@@ -115,10 +115,33 @@ async function activeSession(home, agent) {
   } : null;
 }
 
+async function reportedCodexId(home, reported) {
+  if (reported?.agent !== 'codex') return null;
+  if (reported.kind === 'id') return SESSION_ID.test(reported.value) ? reported.value : null;
+  if (reported.kind !== 'path' || typeof reported.value !== 'string') return null;
+  // A Herdr path mapping is accepted only inside this Codex home's session roots.
+  const path = resolve(reported.value);
+  const inside = ['sessions', 'archived_sessions'].some(root => {
+    const tail = relative(resolve(home, root), path);
+    return tail && tail !== '..' && !tail.startsWith(`..${win32.sep}`)
+      && !tail.startsWith('../') && !isAbsolute(tail);
+  });
+  if (!inside) return null;
+  const metadata = await sessionMetadata(path).catch(() => null);
+  const id = metadata?.id ?? metadata?.session_id;
+  return SESSION_ID.test(id) && (basename(path) === `${id}.jsonl` || basename(path).endsWith(`-${id}.jsonl`))
+    ? id : null;
+}
+
 /** Share lookups per poll; recovered bindings must still belong to a loaded thread and the same terminal/mapping. */
 export function codexSessionResolver(home, { liveSessions = null, agents = [], stateDir } = {}) {
   let index;
   const headers = new Map();
+  const reportedIds = new Map();
+  const reportedId = agent => {
+    if (!reportedIds.has(agent)) reportedIds.set(agent, reportedCodexId(home, agent.agent_session));
+    return reportedIds.get(agent);
+  };
   const lookup = id => {
     if (!headers.has(id)) headers.set(id, (async () => {
       const file = await locateCodexSession(home, id);
@@ -130,24 +153,7 @@ export function codexSessionResolver(home, { liveSessions = null, agents = [], s
     return headers.get(id);
   };
   return async agent => {
-    const reported = agent.agent_session;
-    let id = reported?.agent === 'codex' && reported.kind === 'id' && SESSION_ID.test(reported.value)
-      ? reported.value : null;
-    if (!id && reported?.agent === 'codex' && reported.kind === 'path' && typeof reported.value === 'string') {
-      // A Herdr path mapping is accepted only inside this Codex home's session roots.
-      const path = resolve(reported.value);
-      const inside = ['sessions', 'archived_sessions'].some(root => {
-        const tail = relative(resolve(home, root), path);
-        return tail && tail !== '..' && !tail.startsWith(`..${win32.sep}`)
-          && !tail.startsWith('../') && !isAbsolute(tail);
-      });
-      if (inside) {
-        const metadata = await sessionMetadata(path).catch(() => null);
-        const candidate = metadata?.id ?? metadata?.session_id;
-        if (SESSION_ID.test(candidate) && (basename(path) === `${candidate}.jsonl`
-          || basename(path).endsWith(`-${candidate}.jsonl`))) id = candidate;
-      }
-    }
+    const id = await reportedId(agent);
     const explicit = id ? await lookup(id) : null;
     const wrongCwd = explicit?.metadata?.cwd && agent.cwd && !sameDirectory(explicit.metadata.cwd, agent.cwd);
     const names = titleNames(agent);
@@ -184,7 +190,7 @@ export function codexSessionResolver(home, { liveSessions = null, agents = [], s
         // loaded in this poll. /clear removes it from that list immediately.
         const bound = await lookup(binding.sessionId);
         if (bound?.metadata && sameDirectory(bound.metadata.cwd, agent.cwd)) {
-          live.push({ id: binding.sessionId, cwd: agent.cwd, status: 'unknown' });
+          live.push({ id: binding.sessionId, cwd: agent.cwd, status: 'unknown', name: binding.name });
         }
       }
       if (liveSessions.some(thread => thread.metadataUnavailable)) {
@@ -196,10 +202,15 @@ export function codexSessionResolver(home, { liveSessions = null, agents = [], s
       if (live.length) {
         const peers = agents.filter(other => other.agent === 'codex' && other.pane_id !== agent.pane_id
           && sameDirectory(other.cwd, agent.cwd));
-        const claimed = new Set(peers.map(other => other.agent_session?.value));
+        const peerIds = await Promise.all(peers.map(reportedId));
+        const claimed = new Set(peerIds);
+        const unmapped = peers.filter((_, i) => !liveSessions.some(thread => thread.id === peerIds[i]));
         let candidates = live.filter(thread => !claimed.has(thread.id));
-        // Two unmapped panes in one directory are not distinguishable by cwd.
-        if (peers.some(other => !liveSessions.some(thread => thread.id === other.agent_session?.value))) candidates = [];
+        // Shared directories require distinct title matches where Herdr has no pane mapping.
+        if (unmapped.length) {
+          const exact = candidates.filter(thread => names.has(thread.name));
+          candidates = exact.length === 1 && unmapped.every(other => !titleNames(other).has(exact[0].name)) ? exact : [];
+        }
         if (agent.agent_status === 'working') {
           const active = candidates.filter(thread => thread.status === 'active');
           if (active.length) candidates = active;
@@ -213,11 +224,13 @@ export function codexSessionResolver(home, { liveSessions = null, agents = [], s
           if (bound) candidates = [bound];
         }
         if (candidates.length !== 1) return { sessionId: null, reason: 'ambiguous-agent-session' };
-        const candidate = await lookup(candidates[0].id);
+        const thread = candidates[0];
+        const candidate = await lookup(thread.id);
         if (!candidate?.metadata || !sameDirectory(candidate.metadata.cwd, agent.cwd)) {
-          return { sessionId: candidates[0].id, sessionSource: 'codex-live', reason: 'session-file-not-found' };
+          return { sessionId: thread.id, sessionSource: 'codex-live', reason: 'session-file-not-found' };
         }
-        if (bindingFile) await writeJson(bindingFile, { sessionId: candidate.id }).catch(() => {});
+        const name = names.has(thread.name) ? thread.name : undefined;
+        if (bindingFile) await writeJson(bindingFile, { sessionId: candidate.id, name }).catch(() => {});
         return { sessionId: candidate.id, file: candidate.file, sessionSource: 'codex-live', reason: null };
       }
       if (recovered) return { sessionId: null, reason: 'no-agent-session' };

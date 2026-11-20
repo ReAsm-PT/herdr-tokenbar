@@ -361,6 +361,42 @@ test('one live thread cannot be assigned to two unmapped panes in the same direc
   assert.deepEqual(entries.map(entry => entry.reason), ['ambiguous-agent-session', 'ambiguous-agent-session']);
 });
 
+test('unique live titles resolve two unreported panes in the same cwd during complete and partial polls', async t => {
+  const f = await fixture(t);
+  await f.session(); await f.session(OTHER, { total: 9000 }); await f.session(THIRD);
+  const agents = [f.agent({ terminal_id: 'terminal-1', agent_status: 'working' }),
+    f.agent({ pane_id: 'w1:p2', terminal_id: 'terminal-2', terminal_title_stripped: 'Other task | project',
+      agent_status: 'working', focused: false })];
+  const liveSessions = [liveThread(OTHER, f.cwd, { name: 'Other task' }), liveThread(ID, f.cwd, { name: 'Task' }),
+    liveThread(THIRD, f.cwd, { name: 'Earlier task', status: 'idle' })];
+  const options = f.options(agents);
+  for (const sessions of [liveSessions, [{ id: ID, metadataUnavailable: true }, ...liveSessions.filter(thread => thread.id !== ID)]]) {
+    const entries = await collectAgentUsages({ ...options, liveSessions: sessions });
+    assert.deepEqual(entries.map(entry => [entry.sessionId, entry.usage?.total]), [[ID, 990], [OTHER, 8990]]);
+  }
+  const switched = await collectAgentUsages({ ...options, liveSessions: [liveSessions[0], { id: THIRD, metadataUnavailable: true }] });
+  assert.equal(switched[0].usage, null);
+  assert.equal(switched[1].sessionId, OTHER);
+});
+
+test('unreported panes with a shared title cannot claim the same named live thread', async t => {
+  const f = await fixture(t); await f.session(); await f.session(OTHER);
+  const agents = [f.agent(), f.agent({ pane_id: 'w1:p2', focused: false })];
+  const liveSessions = [liveThread(ID, f.cwd, { name: 'Task' }), liveThread(OTHER, f.cwd, { name: 'Another task' })];
+  const entries = await collectAgentUsages({ ...f.options(agents), liveSessions });
+  assert.deepEqual(entries.map(entry => entry.reason), ['ambiguous-agent-session', 'ambiguous-agent-session']);
+});
+
+test('a titled live thread cannot be borrowed from a pane that reports its transcript path', async t => {
+  const f = await fixture(t); const file = await f.session(); await f.session(OTHER); await f.session(THIRD);
+  const agents = [f.agent(), f.agent({ pane_id: 'w1:p2', focused: false, terminal_title_stripped: 'Renamed terminal',
+    agent_session: { agent: 'codex', kind: 'path', value: file } })];
+  const liveSessions = [liveThread(ID, f.cwd, { name: 'Task' }), liveThread(OTHER, f.cwd), liveThread(THIRD, f.cwd)];
+  const entries = await collectAgentUsages({ ...f.options(agents), liveSessions });
+  assert.equal(entries[0].reason, 'ambiguous-agent-session');
+  assert.equal(entries[1].sessionId, ID);
+});
+
 test('an unavailable local daemon preserves an existing valid reported session', async t => {
   const f = await fixture(t); await f.session(); await f.index();
   const result = await collectStatus({ ...f.options([f.agent({ agent_session: { agent: 'codex', kind: 'id', value: ID } })]), liveSessions: null });
